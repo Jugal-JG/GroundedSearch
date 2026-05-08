@@ -155,7 +155,7 @@ class GroundedSearchEngine:
     def __init__(self, max_searches: int = 5):
         api_key = os.environ.get("GEMINI_API_KEY")
         self.model_id = os.environ.get("GEMMA_MODEL", "gemma-4-31b-it")
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key)   # no global timeout — handled per-call in _generate()
         self.search_tool = WikipediaSearchTool()
         self.max_searches = max_searches
 
@@ -165,27 +165,47 @@ class GroundedSearchEngine:
     # ------------------------------------------------------------------
 
     def _generate(self, contents, config, max_retries: int = 2):
+        """
+        Wraps generate_content with:
+          1. A 2-minute per-call timeout via concurrent.futures — catches hung calls
+             (e.g. attempt 2 with a large accumulated context on the free tier).
+             The global client has NO timeout so normal calls aren't killed early.
+          2. Retry logic (up to 2 retries, 1s/2s backoff) for transient 500/503 errors.
+        Timeouts are NOT retried — a hung call won't un-hang on retry.
+        """
         last_exc = None
         for attempt in range(max_retries + 1):
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(
+                self.client.models.generate_content,
+                model=self.model_id,
+                contents=contents,
+                config=config,
+            )
             try:
-                return self.client.models.generate_content(
-                    model=self.model_id,
-                    contents=contents,
-                    config=config,
+                result = future.result(timeout=120)   # 2 minutes — generous for any normal call
+                executor.shutdown(wait=False)
+                return result
+            except concurrent.futures.TimeoutError:
+                executor.shutdown(wait=False)
+                print("[engine] API call timed out after 120s")
+                raise RuntimeError(
+                    "Gemma API timed out (>2 min). The question may need too many searches — try rephrasing or use Fast mode."
                 )
             except Exception as exc:
+                executor.shutdown(wait=False)
                 last_exc = exc
                 err_str = str(exc)
                 is_transient = any(
                     k in err_str for k in ("500", "INTERNAL", "503", "UNAVAILABLE", "overloaded")
                 )
                 if attempt < max_retries and is_transient:
-                    wait = 2 ** attempt          # 1s, 2s
+                    wait = 2 ** attempt          # 1s then 2s
                     print(f"[engine] API error (attempt {attempt+1}), retrying in {wait}s: {exc}")
                     time.sleep(wait)
                     continue
                 raise
-        raise last_exc  # unreachable but satisfies linters
+        raise last_exc
 
     def search(self, query: str):
         """
@@ -219,6 +239,10 @@ class GroundedSearchEngine:
 
         for attempt in range(self.max_searches):
             print(f"[retrieval] attempt {attempt + 1}")
+            # After the first search, tell the UI the model is still working.
+            # Without this the spinner just sits there silently between searches.
+            if attempt > 0:
+                yield {"type": "thinking", "attempt": attempt + 1}
             response = self._generate(
                 contents=prompt + accumulated,
                 config=types.GenerateContentConfig(
@@ -311,6 +335,10 @@ class GroundedSearchEngine:
                     "  BAD:  'Oppenheimer'                GOOD: 'Oppenheimer film'\n"
                     "  BAD:  'Are You There God Margaret' GOOD: 'Are You There God Margaret film'\n"
                     "  BAD:  'Barbie'                     GOOD: 'Barbie 2023 film'\n"
+                    "- If the question asks about a PERSON (current, most recent, appointed, who is the), search for the SPECIFIC ROLE or TITLE, not the institution.\n"
+                    "  BAD:  'Supreme Court of India'     GOOD: 'Chief Justice of India'\n"
+                    "  BAD:  'Supreme Court United States' GOOD: 'Chief Justice of the United States'\n"
+                    "  BAD:  'NASA'                       GOOD: 'NASA administrator'\n"
                     "- Reply with ONLY the search term(s), nothing else.\n"
                     f"Question: {query}"
                 ),

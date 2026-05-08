@@ -876,6 +876,14 @@
         break;
       }
 
+      case 'thinking': {
+        // Model is generating the next search query between retrieval attempts.
+        // Update the header so user knows it's still working, not frozen.
+        const sh = document.getElementById(`sh-${msgId}`);
+        if (sh) sh.innerHTML = `<div class="spinner" id="spin-${msgId}"></div> Analysing results, searching more&hellip;`;
+        break;
+      }
+
       case 'answer_start': {
         const sh   = document.getElementById(`sh-${msgId}`);
         const spin = document.getElementById(`spin-${msgId}`);

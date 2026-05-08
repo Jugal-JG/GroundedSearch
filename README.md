@@ -1,14 +1,19 @@
 # GroundedSearch — Wikipedia RAG with Gemma 4 31B
 
+> **Educational Project:** This is built for learning purposes. Expect some lag in responses (10–45 seconds depending on mode). If you get an error, simply re-ask the same question, transient API errors are common on the free tier and usually resolve on the next attempt. If the answer seems incomplete or off-topic, switch modes and try again.
+
 A grounded AI search assistant that answers questions by iteratively searching Wikipedia, then synthesising a factual answer using **Gemma 4 31B** via Google AI Studio. Built with Flask and a custom dark-theme chat UI.
 
 > Adapted from the [Anthropic Wikipedia Search Cookbook](https://github.com/anthropics/anthropic-cookbook) (originally written for Claude 2). Modernised with the `google-genai` SDK, a three-phase RAG pipeline, and real-time SSE streaming.
+
+**[Live Demo](https://groundedsearch.onrender.com):** Try it now! Deployed on Render free tier.
 
 ---
 
 ## Demo
 
 **GroundedSearch mode** (thorough, ~25–45s):
+
 ```
 User  →  "Which movie came out first: Oppenheimer, or Are You There God It's Me Margaret?"
 
@@ -25,17 +30,30 @@ App   →  🔍 Searching Wikipedia: "Oppenheimer movie"
 ```
 
 **Fast mode** (quick, ~10–15s):
+
 ```
-User  →  "Which movie came out first: Oppenheimer, or Are You There God It's Me Margaret?"
+User  →  "Who is the most recently appointed Supreme Court justice in USA and India?"
 
-App   →  🔍 Searching Wikipedia: "Oppenheimer film"      ← parallel
-         🔍 Searching Wikipedia: "Are You There God Margaret film"  ← parallel
+App   →  🔍 Searching: "Chief Justice of the United States"   ← parallel
+         🔍 Searching: "Chief Justice of India"               ← parallel
 
-         Are You There God? It's Me, Margaret. came out first
-         (April 28, 2023). Oppenheimer released July 21, 2023.
+         The most recently confirmed US Supreme Court Justice is ...
+         The current Chief Justice of India is Surya Kant, appointed November 24, 2025.
 
-         Sources: [Oppenheimer (film) ↗]  [Are You There God?... ↗]
+         Sources: [Chief Justice of the United States ↗]  [Chief Justice of India ↗]
 ```
+
+---
+
+## Tips for Best Results
+
+| Situation                                             | What to do                                                                                       |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Got a red error banner                                | Re-ask the same question — transient API 500s resolve on retry                                  |
+| Answer is vague or says "context does not contain..." | Switch to**🔬 GroundedSearch** — it does iterative searches and finds more specific articles    |
+| GroundedSearch is taking too long                     | Switch to**⚡ Fast** for a quicker answer                                                        |
+| Search found the wrong Wikipedia article              | Rephrase with more specific proper nouns (e.g. "Oppenheimer 2023 film" instead of "Oppenheimer") |
+| Spinner stuck after an error                          | The spinner now auto-stops on errors — if still stuck, refresh the page                         |
 
 ---
 
@@ -43,13 +61,13 @@ App   →  🔍 Searching Wikipedia: "Oppenheimer film"      ← parallel
 
 Traditional RAG systems embed documents into a vector store and do semantic search. This project takes a different — and cost-free — approach:
 
-| Approach | This project | Traditional RAG |
-|---|---|---|
-| Knowledge source | Wikipedia (free, always up-to-date) | Your own document store |
-| Retrieval method | Keyword search via Wikipedia API | Semantic vector search |
-| Embedding cost | Zero | Paid embedding API |
-| Hallucination risk | Low — model answers from retrieved text | Low — same grounding principle |
-| Setup complexity | Minimal | Requires vector DB + embedding pipeline |
+| Approach           | This project                             | Traditional RAG                         |
+| ------------------ | ---------------------------------------- | --------------------------------------- |
+| Knowledge source   | Wikipedia (free, always up-to-date)      | Your own document store                 |
+| Retrieval method   | Keyword search via Wikipedia API         | Semantic vector search                  |
+| Embedding cost     | Zero                                     | Paid embedding API                      |
+| Hallucination risk | Low — model answers from retrieved text | Low — same grounding principle         |
+| Setup complexity   | Minimal                                  | Requires vector DB + embedding pipeline |
 
 The model is explicitly instructed **not to answer from memory** — it must retrieve Wikipedia pages first, then compose its answer from that content only.
 
@@ -57,45 +75,48 @@ The model is explicitly instructed **not to answer from memory** — it must ret
 
 ## Two Modes
 
-### GroundedSearch (thorough)
+### ⚡ Fast mode (~10–15s)
+
+A simplified single-pass pipeline designed for speed:
+
+```
+Step 1  →  Keyword extraction (max 50 tokens, ~1s)
+            Gemma extracts 1–2 smart search terms with disambiguation rules:
+            • Movies/books/songs → adds "film" / "novel" / "song"
+            • Person queries (who is, most recent, appointed) → searches the
+              ROLE article, not the institution
+              e.g. "Chief Justice of India" not "Supreme Court of India"
+            • Comparison questions → 2 lines, one term per subject
+
+Step 2  →  Up to 2 Wikipedia searches IN PARALLEL
+            Both fetches fire simultaneously — same wall-clock time as one
+
+Step 3  →  Single streaming answer call grounded in the combined Wikipedia context
+```
+
+**When Fast mode may not give a perfect answer:**
+Wikipedia search is keyword-based, not semantic. If the extracted keywords land on the wrong article (e.g. an institution overview instead of a person-role article), the model will correctly say "the context does not contain this information" rather than hallucinate. In that case, switch to GroundedSearch — its iterative loop self-corrects when the first result is wrong.
+
+### 🔬 GroundedSearch mode (~25–45s)
 
 The full three-phase RAG pipeline from the original cookbook:
 
 ```
 Phase 1a  →  Tool description prompt
               Gemma plans searches in <scratchpad>
-              Emits <search_query>keywords</search_query>
+              Emits <search_query>keywords</search_query>  (1–4 words, atomic)
 
 Phase 1b  →  Engine intercepts the tag, queries Wikipedia
               Injects <search_results> into the prompt
               Gemma evaluates quality in <search_quality>
               Repeats until <information> tags are emitted (up to 5 iterations)
+              Between searches: UI shows "Analysing results, searching more…"
 
 Phase 2   →  A fresh, clean prompt with only the extracted <information>
-              Gemma synthesises the final answer (streamed)
+              Gemma synthesises the final answer (streamed token by token)
 ```
 
-Best for: multi-part questions, comparisons, research topics that need several Wikipedia sources.
-
-### Fast mode (quick)
-
-A simplified single-pass pipeline:
-
-```
-Step 1  →  Keyword extraction call (max 50 tokens, ~1s)
-            Gemma extracts 1–2 search terms with disambiguation
-            (e.g. "Oppenheimer film", "Are You There God Margaret film")
-
-Step 2  →  Up to 2 Wikipedia searches run IN PARALLEL
-            Both fetches fire simultaneously — same wall-clock time as one
-
-Step 3  →  Single streaming answer call grounded in the combined Wikipedia context
-```
-
-Best for: factual lookups, single-subject questions, comparison of two things.
-
-**Why parallel searches keep Fast mode fast:**
-If a question involves two subjects, both Wikipedia fetches fire at the same time via `ThreadPoolExecutor`. Two parallel fetches at 2s each still take ~2s total — not 4s. You only pay for the slower of the two.
+Best for: multi-part questions, comparisons, person/role lookups, anything that needs several Wikipedia sources.
 
 ---
 
@@ -106,37 +127,40 @@ If a question involves two subjects, both Wikipedia fetches fire at the same tim
 │                  Browser (Chat UI)                   │
 │  Dark glassmorphism UI · Mode toggle (Fast/Grounded) │
 │  Per-mode chat history · New Chat button             │
-│  Live search progress · Token streaming              │
-│  Wikipedia source cards                              │
+│  Live search progress · "Analysing…" between searches│
+│  Token streaming · Wikipedia source cards            │
 └───────────────────┬──────────────────────────────────┘
                     │  POST /chat  (SSE stream)
 ┌───────────────────▼──────────────────────────────────┐
 │              Flask  (groundedsearch.py)               │
 │  Background thread + queue + 10s heartbeat           │
 │  Routes to fast_search() or search() based on mode   │
-│  Prevents browser SSE timeout during API calls       │
+│  Prevents browser SSE timeout during long API calls  │
 └───────────────────┬──────────────────────────────────┘
                     │
 ┌───────────────────▼──────────────────────────────────┐
 │           RAG Engine  (rag_engine.py)                 │
 │                                                      │
-│  _generate() retry helper                            │
-│    Wraps all non-streaming API calls                 │
-│    Auto-retries on 500/503 with exponential backoff  │
+│  _generate() — safe API wrapper                      │
+│    • 2-minute thread-based timeout (prevents hangs)  │
+│    • Auto-retry on 500/503 with 1s/2s backoff        │
+│    • Timeouts are not retried (hang won't un-hang)   │
 │                                                      │
 │  search()  — GroundedSearch mode                     │
 │    Phase 1: iterative <search_query> loop            │
+│    Emits thinking event between attempts             │
 │    Phase 2: answer synthesis                         │
 │                                                      │
 │  fast_search()  — Fast mode                          │
-│    Keyword extraction → parallel Wikipedia fetches   │
+│    Smart keyword extraction with disambiguation      │
+│    → parallel Wikipedia fetches (ThreadPoolExecutor) │
 │    → single streaming answer                         │
 └───────────────┬──────────────────────────────────────┘
                 │
 ┌───────────────▼──────────────┐  ┌────────────────────┐
 │  Gemma 4 31B                 │  │  Wikipedia API      │
 │  Google AI Studio (free tier)│  │  wikipedia library  │
-│  google-genai SDK            │  │  2 results per query│
+│  google-genai SDK            │  │  2 results / query  │
 └──────────────────────────────┘  └────────────────────┘
 ```
 
@@ -152,6 +176,7 @@ WikiPedia/
 │   └── index.html             # Chat UI — dark theme, streaming, source cards
 ├── .env                       # API key + model config (not committed)
 ├── requirements.txt           # Python dependencies
+├── Procfile                   # Render deployment start command
 ├── wikipedia-search-cookbook.ipynb   # Original Anthropic cookbook (reference)
 └── README.md
 ```
@@ -199,9 +224,42 @@ Open [http://localhost:5000](http://localhost:5000)
 
 ---
 
+## Deployment (Render — free tier)
+
+### Steps
+
+1. Push to GitHub (`.env` is gitignored — never committed)
+2. Go to [render.com](https://render.com) → **New → Web Service**
+3. Connect your GitHub repo
+4. Set build/start commands:
+
+| Field         | Value                                                                          |
+| ------------- | ------------------------------------------------------------------------------ |
+| Build Command | `pip install -r requirements.txt`                                            |
+| Start Command | `gunicorn groundedsearch:app --timeout 120 --workers 2 --bind 0.0.0.0:$PORT` |
+| Instance Type | Free                                                                           |
+
+5. Add environment variables in the Render dashboard:
+
+| Key                | Value              |
+| ------------------ | ------------------ |
+| `GEMINI_API_KEY` | your actual key    |
+| `GEMMA_MODEL`    | `gemma-4-31b-it` |
+
+### Free tier behaviour
+
+| Thing            | Limit / behaviour                                             |
+| ---------------- | ------------------------------------------------------------- |
+| Hours/month      | 750 (enough for 1 always-on service)                          |
+| Inactivity sleep | Spins down after 15 min idle — ~30s cold start on next visit |
+| Bandwidth        | 100 GB/month                                                  |
+| Custom domain    | Free (add a CNAME)                                            |
+
+---
+
 ## SSE Streaming Architecture
 
-Standard Flask + SSE breaks on long AI inference calls because the browser will drop a silent connection after ~30 seconds. This project solves it with a **thread + queue + heartbeat** pattern:
+Standard Flask + SSE breaks on long AI inference calls because the browser drops a silent connection after ~30 seconds. This project solves it with a **thread + queue + heartbeat** pattern:
 
 ```python
 # groundedsearch.py
@@ -220,7 +278,7 @@ def generate():
             if event is None: break
             yield f"data: {json.dumps(event)}\n\n"
         except queue.Empty:
-            yield ": heartbeat\n\n"   # SSE comment keeps connection alive
+            yield ": heartbeat\n\n"   # SSE comment — keeps TCP connection open
 ```
 
 The `: heartbeat` line is an SSE comment — browsers ignore it but the TCP connection stays open, preventing timeout during long Gemma inference calls.
@@ -231,93 +289,106 @@ The `: heartbeat` line is an SSE comment — browsers ignore it but the TCP conn
 
 The `/chat` endpoint streams newline-delimited JSON events:
 
-| Event type | Payload | UI effect |
-|---|---|---|
-| `search_start` | `{"query": "Oppenheimer film"}` | Amber pulsing dot appears |
-| `search_done` | `{"query": "...", "title": "...", "url": "..."}` | Dot turns green + Wikipedia link |
-| `search_empty` | `{"query": "..."}` | Dot turns grey + "no results, retrying…" |
-| `answer_start` | `{}` | Search section collapses, answer area opens |
-| `token` | `{"content": "..."}` | Token appended and rendered as Markdown |
-| `sources` | `{"sources": [...]}` | Wikipedia source cards appear below answer |
-| `done` | `{}` | Streaming cursor removed |
-| `error` | `{"message": "..."}` | Spinner stopped, red error banner shown |
+| Event type       | Payload                                            | UI effect                                               |
+| ---------------- | -------------------------------------------------- | ------------------------------------------------------- |
+| `search_start` | `{"query": "Chief Justice of India"}`            | Amber pulsing dot appears                               |
+| `search_done`  | `{"query": "...", "title": "...", "url": "..."}` | Dot turns green + Wikipedia link                        |
+| `search_empty` | `{"query": "..."}`                               | Dot turns grey + "no results, retrying…"               |
+| `thinking`     | `{"attempt": 2}`                                 | Header updates to "Analysing results, searching more…" |
+| `answer_start` | `{}`                                             | Search section collapses, answer area opens             |
+| `token`        | `{"content": "..."}`                             | Token appended and rendered as Markdown                 |
+| `sources`      | `{"sources": [...]}`                             | Wikipedia source cards appear below answer              |
+| `done`         | `{}`                                             | Streaming cursor removed                                |
+| `error`        | `{"message": "..."}`                             | Spinner stopped, red "Search failed" banner             |
 
-> **Note:** `search_done` now always includes the `query` field so the frontend can correctly resolve each search item independently — this is required for Fast mode's parallel searches where multiple `search_done` events arrive out of order.
+> `search_done` always includes `query` so the frontend resolves each search dot independently — required for Fast mode's parallel searches where two `search_done` events arrive simultaneously.
 
 ---
 
 ## UI Features
 
 ### Mode toggle
-A pill toggle in the header switches between **⚡ Fast** and **🔬 GroundedSearch**. Each mode maintains its own separate chat history — switching modes preserves conversations and switching back restores them. The toggle is blocked while a response is streaming.
+
+A pill toggle in the header switches between **⚡ Fast** and **🔬 GroundedSearch**. Toggling is blocked while a response is streaming to prevent state corruption.
 
 ### Per-mode chat history
-Fast and GroundedSearch run as independent conversations. Switching from Fast to GroundedSearch shows that mode's previous messages, not a blank screen. **New Chat** only clears the active mode's history — the other mode is untouched.
+
+Fast and GroundedSearch maintain completely independent conversation histories. Switching modes restores that mode's previous conversation. **New Chat** clears only the active mode — the other mode's history is untouched.
+
+### "Analysing results" indicator (GroundedSearch)
+
+Between retrieval attempts, the search header updates to "Analysing results, searching more…" so you can see the model is still working rather than wondering if it's frozen.
+
+### Error recovery
+
+When the API returns an error or times out, the spinner stops, the header shows "Search failed" in red, and a friendly error message appears. Re-asking the same question usually works — free-tier 500 errors are transient.
 
 ### New Chat button
-Clears only the current mode's conversation and restores the welcome screen with example prompts.
 
-### Mode pill on responses
-Each AI response shows a coloured pill (yellow ⚡ for Fast, purple 🔬 for GroundedSearch) so you can tell at a glance which mode produced which answer when comparing results.
+Clears only the current mode's conversation and restores the welcome screen with example prompts.
 
 ---
 
 ## Performance Notes
 
-### GroundedSearch: why answers take 25–45 seconds
+### Why responses take time
+
+This is an educational project running on **Google AI Studio's free tier**. Responses are intentionally slower than a paid deployment:
 
 ```
-Wikipedia search + page fetch        ~1–3 s   per search
-Gemma generation (retrieval phase)   ~3–8 s   per attempt  (300 token cap)
-Gemma generation (answer phase)      ~10–20 s              (1024 token cap, streamed)
+Wikipedia search + page fetch              ~1–3 s   per search
+Gemma generation (GroundedSearch retrieval) ~3–8 s   per attempt (300 token cap)
+Gemma generation (answer synthesis)        ~10–20 s (1024 token cap, streamed)
+Free-tier API cold start / queue           ~2–10 s  (variable)
 ```
 
-For a two-search comparison query: `3 + 3 + 8 + 3 + 8 + 15 ≈ 40 seconds` total.
+For a two-search GroundedSearch query: roughly `3 + 8 + 3 + 8 + 15 ≈ 37 seconds` total. Fast mode cuts this to ~10–15s by doing one pass with parallel searches.
 
-### Fast mode: why it stays fast with two searches
+### Why Fast mode sometimes says "context does not contain..."
 
-Fast mode uses `ThreadPoolExecutor` to run both Wikipedia fetches simultaneously. Two parallel fetches at ~2s each still complete in ~2s — not 4s. The only added cost over a single-subject question is a slightly larger answer prompt.
+Wikipedia's keyword search is not semantic. If the extracted keywords land on an overview/institution article instead of the specific person-role article, the answer won't be in the retrieved text. The model correctly reports this rather than hallucinating. **Switch to GroundedSearch** — its iterative loop can self-correct with follow-up searches.
 
-### Why max_output_tokens=300 in the GroundedSearch retrieval loop
+### Why the same question sometimes fails then works
 
-Generation speed on the free tier is approximately 15–40 tokens/second. Without this cap, if Gemma wrote a verbose `<search_quality>` section (400–800 tokens) before the next `<search_query>` tag, that produced **10–53 seconds of silence** with the browser appearing frozen. Capping at 300 tokens limits any single retrieval generation to **7–20 seconds maximum**.
+Google AI Studio's free tier returns sporadic `500 INTERNAL` errors, especially during peak hours. The engine retries automatically (up to 2 times, 1s/2s backoff). If it still fails, wait 10–15 seconds and re-ask — the error is on Google's side, not in your question.
 
-### Why 20,000 character page truncation
+### Timeout protection
 
-Gemma 4 31B has a 256k token context window with fast parallel prefill. 20,000 characters (~5,000 tokens) is approximately 2% of the context window — prefill is not the bottleneck. In Fast mode, when two articles are fetched, each is capped at 10,000 characters so the combined answer prompt stays under 20,000 characters total, preventing silent API failures.
+All non-streaming API calls go through `_generate()`, a safe wrapper that:
 
-### API retry logic
-
-All non-streaming Gemma calls go through `_generate()`, a retry wrapper that automatically retries up to 2 times (with 1s and 2s backoff) on transient 500/503 errors from Google's free tier. Streaming answer calls also retry up to 3 times on the same conditions.
+- Runs the call in a background thread
+- Raises a `RuntimeError` after **2 minutes** if no response arrives (prevents infinite spinner)
+- **Does not retry timeouts** — a hung call won't un-hang on a second attempt
 
 ---
 
 ## Free Tier Limits (Google AI Studio)
 
-| Resource | Limit |
-|---|---|
-| Requests per minute (RPM) | 15 |
-| Tokens per minute (TPM) | Unlimited |
-| Requests per day (RPD) | 1,500 |
+| Resource                  | Limit     |
+| ------------------------- | --------- |
+| Requests per minute (RPM) | 15        |
+| Tokens per minute (TPM)   | Unlimited |
+| Requests per day (RPD)    | 1,500     |
 
-A single GroundedSearch query uses 3–6 API requests (retrieval attempts + answer). Fast mode uses 2 requests (keyword extraction + answer). At 1,500 RPD you can handle ~250–750 queries per day on the free tier.
+A single GroundedSearch query uses 3–6 API requests (retrieval attempts + answer). Fast mode uses 2 requests (keyword extraction + answer). At 1,500 RPD you can handle ~250–750 queries per day.
 
 ---
 
 ## Differences from the Original Cookbook
 
-| Aspect | Cookbook (Claude 2) | This project (Gemma 4 31B) |
-|---|---|---|
-| LLM SDK | `anthropic` (legacy) | `google-genai` |
-| Model | `claude-2` | `gemma-4-31b-it` |
-| Tokenizer | Anthropic tokenizer for truncation | Character-based truncation |
+| Aspect         | Cookbook (Claude 2)                     | This project (Gemma 4 31B)                        |
+| -------------- | --------------------------------------- | ------------------------------------------------- |
+| LLM SDK        | `anthropic` (legacy)                  | `google-genai`                                  |
+| Model          | `claude-2`                            | `gemma-4-31b-it`                                |
+| Tokenizer      | Anthropic tokenizer for truncation      | Character-based truncation                        |
 | Stop sequences | `AI_PROMPT` / `HUMAN_PROMPT` format | `</search_query>` via `GenerateContentConfig` |
-| Serving | Jupyter notebook only | Flask app with SSE streaming |
-| Frontend | None (stdout) | Dark glassmorphism UI with live search progress |
-| Concurrency | Synchronous | Background thread + queue + heartbeat |
-| Search modes | Single mode | Fast (parallel) + GroundedSearch (iterative) |
-| Chat history | N/A | Per-mode independent conversation history |
-| Error handling | Basic | Retry logic, spinner cleanup, friendly messages |
+| Serving        | Jupyter notebook only                   | Flask app with SSE streaming                      |
+| Frontend       | None (stdout)                           | Dark glassmorphism UI with live search progress   |
+| Concurrency    | Synchronous                             | Background thread + queue + heartbeat             |
+| Search modes   | Single mode                             | Fast (parallel) + GroundedSearch (iterative)      |
+| Chat history   | N/A                                     | Per-mode independent conversation history         |
+| Error handling | Basic                                   | Retry logic, timeout protection, spinner cleanup  |
+| Deployment     | Local only                              | Render-ready (Procfile + gunicorn)                |
 
 ---
 
@@ -332,26 +403,30 @@ Wikipedia's API occasionally returns empty responses when rate-limited. The engi
 **"Network error" in the browser**
 Usually means the Flask server crashed. Check the terminal for a Python traceback.
 
-**`ServerError: 500 INTERNAL` from Google API**
-These are transient free-tier errors. The retry logic handles them automatically (you'll see `[engine] API error, retrying` in the terminal). If they happen consistently, wait a minute — you may have hit the 15 RPM limit.
+**`ServerError: 500 INTERNAL` / red "Search failed" banner**
+Transient free-tier error from Google's API. Re-ask the same question — the retry logic handles single failures automatically; persistent failures clear on the next request.
 
-**Answer is correct but search dot stays amber/blinking**
-This was a known bug (now fixed) where parallel `search_done` events were matched to the wrong UI element. If you still see it, hard-refresh the browser to clear cached JS.
+**"Gemma API timed out (>2 min)"**
+The free-tier API occasionally hangs on complex questions with large accumulated context. Re-ask or switch to Fast mode for a quicker answer.
 
-**Answer quality is poor in Fast mode**
-Wikipedia's keyword search sometimes returns off-topic articles for unusual titles. Switch to GroundedSearch mode — its iterative loop is better at self-correcting when the first search result is wrong.
+**Answer says "the context does not contain this information"**
+Fast mode found a Wikipedia article, but it was the wrong type (e.g. institution overview instead of person-role article). Switch to **🔬 GroundedSearch** which iteratively searches until it finds the right content.
+
+**Answer quality is poor**
+Wikipedia's keyword search is not semantic. Try rephrasing with proper nouns, e.g. "Chief Justice of India" instead of "supreme court justice india". GroundedSearch is generally more accurate for complex queries.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| LLM | Gemma 4 31B (Google AI Studio, free tier) |
-| LLM SDK | `google-genai` |
-| Knowledge base | Wikipedia (`wikipedia` Python library) |
-| Backend | Flask 3 |
-| Streaming | Server-Sent Events (SSE) |
-| Concurrency | `threading` (SSE) + `concurrent.futures` (parallel wiki fetches) |
-| Frontend | Vanilla HTML/CSS/JS, Inter font, Marked.js |
-| Config | `python-dotenv` |
+| Layer          | Technology                                                                                   |
+| -------------- | -------------------------------------------------------------------------------------------- |
+| LLM            | Gemma 4 31B (Google AI Studio, free tier)                                                    |
+| LLM SDK        | `google-genai`                                                                             |
+| Knowledge base | Wikipedia (`wikipedia` Python library)                                                     |
+| Backend        | Flask 3 + Gunicorn (production)                                                              |
+| Streaming      | Server-Sent Events (SSE)                                                                     |
+| Concurrency    | `threading` (SSE heartbeat) + `concurrent.futures` (parallel wiki fetches + API timeout) |
+| Frontend       | Vanilla HTML/CSS/JS, Inter font, Marked.js                                                   |
+| Config         | `python-dotenv`                                                                            |
+| Deployment     | Render (free tier)                                                                           |
