@@ -2,11 +2,9 @@
 GroundedSearch — Flask application entry point.
 Run with:  python groundedsearch.py
 
-SSE architecture:
-  The RAG engine runs in a background thread and puts events into a queue.
-  The Flask route drains that queue and forwards events as SSE.
-  While the queue is empty (model is thinking), a heartbeat comment is sent
-  every 10 seconds so the browser never sees a silent connection and disconnects.
+Two modes:
+  grounded  — iterative Wikipedia retrieval loop (thorough, 25-45s)
+  fast      — single Wikipedia search + direct answer  (~10-15s)
 """
 
 import json
@@ -28,6 +26,7 @@ def index():
 def chat():
     data = request.get_json(silent=True) or {}
     query = data.get("query", "").strip()
+    mode  = data.get("mode", "grounded")   # "grounded" | "fast"
 
     if not query:
         return {"error": "No query provided"}, 400
@@ -35,23 +34,18 @@ def chat():
     event_queue: queue.Queue = queue.Queue()
 
     def run_engine():
-        """Runs the RAG engine in a background thread, pushes events to the queue."""
+        generator = engine.fast_search(query) if mode == "fast" else engine.search(query)
         try:
-            for event in engine.search(query):
+            for event in generator:
                 event_queue.put(event)
         except Exception as exc:
             event_queue.put({"type": "error", "message": str(exc)})
         finally:
-            event_queue.put(None)   # sentinel — tells the SSE loop to stop
+            event_queue.put(None)
 
     threading.Thread(target=run_engine, daemon=True).start()
 
     def generate():
-        """
-        Drains the event queue and yields SSE frames.
-        Sends a keep-alive heartbeat comment every 10 s while waiting,
-        preventing the browser from closing the idle connection.
-        """
         while True:
             try:
                 event = event_queue.get(timeout=10)
@@ -59,16 +53,12 @@ def chat():
                     break
                 yield f"data: {json.dumps(event)}\n\n"
             except queue.Empty:
-                # SSE comment — browser ignores it but the connection stays alive
                 yield ": heartbeat\n\n"
 
     return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

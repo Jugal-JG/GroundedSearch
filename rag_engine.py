@@ -19,6 +19,7 @@ import re
 import os
 import time
 import wikipedia
+import concurrent.futures
 from google import genai
 from google.genai import types
 from dataclasses import dataclass
@@ -97,7 +98,7 @@ class WikipediaSearchTool:
     def __init__(self, truncate_chars: int = 20_000):
         self.truncate_chars = truncate_chars
 
-    def search(self, query: str, n_results: int = 1) -> tuple[list[WikipediaSource], str]:
+    def search(self, query: str, n_results: int = 2) -> tuple[list[WikipediaSource], str]:
         """Run a Wikipedia search and return sources + formatted XML string."""
 
         # Small delay between calls to avoid Wikipedia rate-limiting
@@ -158,6 +159,34 @@ class GroundedSearchEngine:
         self.search_tool = WikipediaSearchTool()
         self.max_searches = max_searches
 
+    # ------------------------------------------------------------------
+    # Retry helper — wraps non-streaming generate_content
+    # Retries up to max_retries times on transient 500 errors
+    # ------------------------------------------------------------------
+
+    def _generate(self, contents, config, max_retries: int = 2):
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                return self.client.models.generate_content(
+                    model=self.model_id,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc)
+                is_transient = any(
+                    k in err_str for k in ("500", "INTERNAL", "503", "UNAVAILABLE", "overloaded")
+                )
+                if attempt < max_retries and is_transient:
+                    wait = 2 ** attempt          # 1s, 2s
+                    print(f"[engine] API error (attempt {attempt+1}), retrying in {wait}s: {exc}")
+                    time.sleep(wait)
+                    continue
+                raise
+        raise last_exc  # unreachable but satisfies linters
+
     def search(self, query: str):
         """
         Generator — yields SSE event dicts consumed by Flask's /chat route.
@@ -190,8 +219,7 @@ class GroundedSearchEngine:
 
         for attempt in range(self.max_searches):
             print(f"[retrieval] attempt {attempt + 1}")
-            response = self.client.models.generate_content(
-                model=self.model_id,
+            response = self._generate(
                 contents=prompt + accumulated,
                 config=types.GenerateContentConfig(
                     stop_sequences=["</search_query>"],
@@ -229,7 +257,7 @@ class GroundedSearchEngine:
 
                 if sources:
                     for src in sources:
-                        yield {"type": "search_done", "title": src.title, "url": src.url}
+                        yield {"type": "search_done", "query": search_term, "title": src.title, "url": src.url}
                 else:
                     # Bug fix: always resolve the spinner — never leave it hanging
                     yield {"type": "search_empty", "query": search_term}
@@ -239,7 +267,14 @@ class GroundedSearchEngine:
         info_matches = re.findall(
             r"<information>(.*?)</information>", accumulated, re.DOTALL
         )
-        information = info_matches[-1].strip() if info_matches else accumulated
+        # If the model emitted <information> tags, use that (compact bullet points).
+        # Fallback: use the tail of accumulated but cap at 8000 chars to avoid
+        # flooding the answer prompt with two full 20k-char Wikipedia pages which
+        # triggers Google API 500 errors due to prompt size.
+        if info_matches:
+            information = info_matches[-1].strip()
+        else:
+            information = accumulated[-8000:].strip()
         print(f"[retrieval] done. sources={len(all_sources)}, info_len={len(information)}")
 
         return all_sources, information
@@ -248,23 +283,156 @@ class GroundedSearchEngine:
     # Phase 2 — answer synthesis
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Fast mode  — single Wikipedia search → direct answer
+    # ~10-15 seconds vs 25-45 seconds for full GroundedSearch
+    # ------------------------------------------------------------------
+
+    def fast_search(self, query: str):
+        """
+        Fast mode generator.
+        Step 1: Ask Gemma for up to 2 search terms (one per subject), max 30 tokens.
+        Step 2: Run up to 2 Wikipedia searches IN PARALLEL — same wall-clock time as 1.
+        Step 3: Stream answer grounded in the combined Wikipedia context.
+
+        Parallel searches mean a comparison question ("A vs B") takes ~the same time as
+        a single-subject question because both fetches happen simultaneously.
+        """
+        try:
+            # --- keyword extraction: up to 2 lines, one term per subject ---
+            kw_resp = self._generate(
+                contents=(
+                    "Extract Wikipedia search keywords for the question below.\n"
+                    "Rules:\n"
+                    "- If the question is about ONE thing: reply with 2-4 keywords on a single line.\n"
+                    "- If the question compares or asks about TWO things: reply with exactly 2 lines, one search term per line.\n"
+                    "- ALWAYS add a disambiguating word when the subject could match multiple Wikipedia articles.\n"
+                    "  Examples: a movie → add 'film'   a song → add 'song'   a book → add 'novel'   a place with a common name → add the country/state\n"
+                    "  BAD:  'Oppenheimer'                GOOD: 'Oppenheimer film'\n"
+                    "  BAD:  'Are You There God Margaret' GOOD: 'Are You There God Margaret film'\n"
+                    "  BAD:  'Barbie'                     GOOD: 'Barbie 2023 film'\n"
+                    "- Reply with ONLY the search term(s), nothing else.\n"
+                    f"Question: {query}"
+                ),
+                config=types.GenerateContentConfig(
+                    max_output_tokens=50,
+                    temperature=0.0,
+                ),
+            )
+            raw_terms = (kw_resp.text or query).strip().splitlines()
+            # Keep at most 2 non-empty terms
+            search_terms = [t.strip() for t in raw_terms if t.strip()][:2]
+            if not search_terms:
+                search_terms = [query]
+            print(f"[fast] search_terms: {search_terms!r}")
+
+            # --- fire search_start for each term immediately (UI shows spinners) ---
+            for term in search_terms:
+                yield {"type": "search_start", "query": term}
+
+            # --- run all Wikipedia searches IN PARALLEL ---
+            def _fetch(term):
+                return term, *self.search_tool.search(term, n_results=1)
+
+            all_sources: list[WikipediaSource] = []
+            result_parts: list[str] = []
+
+            # Cap per-article chars so combined prompt stays under 20k total
+            per_article_cap = 20_000 // max(len(search_terms), 1)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(search_terms)) as pool:
+                futures = {pool.submit(_fetch, t): t for t in search_terms}
+                for fut in concurrent.futures.as_completed(futures):
+                    term, sources, result_xml = fut.result()
+                    result_parts.append(result_xml[:per_article_cap])
+                    if sources:
+                        all_sources.extend(sources)
+                        # Use the first source for the UI display (best match)
+                        src = sources[0]
+                        yield {"type": "search_done", "query": term, "title": src.title, "url": src.url}
+                    else:
+                        yield {"type": "search_empty", "query": term}
+
+            combined_xml = "\n".join(result_parts)
+
+            # --- stream answer ---
+            yield {"type": "answer_start"}
+
+            answer_prompt = (
+                f"Answer the following question accurately and concisely.\n"
+                f"Use the Wikipedia context below as your primary source.\n"
+                f"If the context does not contain the answer, say so clearly.\n\n"
+                f"Question: {query}\n\n"
+                f"Wikipedia Context:\n{combined_xml}\n\n"
+                f"Answer:"
+            )
+
+            # Stream with retry on 500/503
+            for stream_attempt in range(3):
+                try:
+                    for chunk in self.client.models.generate_content_stream(
+                        model=self.model_id,
+                        contents=answer_prompt,
+                        config=types.GenerateContentConfig(
+                            max_output_tokens=1024,
+                            temperature=0.2,
+                        ),
+                    ):
+                        text = getattr(chunk, "text", None)
+                        if text:
+                            yield {"type": "token", "content": text}
+                    break  # success — exit retry loop
+                except Exception as exc:
+                    err_str = str(exc)
+                    is_transient = any(k in err_str for k in ("500", "INTERNAL", "503", "UNAVAILABLE", "overloaded"))
+                    if stream_attempt < 2 and is_transient:
+                        print(f"[fast] stream error (attempt {stream_attempt+1}), retrying: {exc}")
+                        time.sleep(2 ** stream_attempt)
+                        continue
+                    raise
+
+            if all_sources:
+                yield {
+                    "type": "sources",
+                    "sources": [{"title": s.title, "url": s.url} for s in all_sources],
+                }
+
+            yield {"type": "done"}
+            print("[fast] done.")
+
+        except Exception as exc:
+            print(f"[fast] error: {type(exc).__name__}: {exc}")
+            yield {"type": "error", "message": f"API error — please try again. ({type(exc).__name__})"}
+
     def _answer_phase(self, query: str, information: str, all_sources: list[WikipediaSource]):
         answer_prompt = ANSWER_PROMPT.format(query=query, information=information)
 
         yield {"type": "answer_start"}
         print("[answer] streaming...")
 
-        for chunk in self.client.models.generate_content_stream(
-            model=self.model_id,
-            contents=answer_prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=1024,
-                temperature=0.2,
-            ),
-        ):
-            text = getattr(chunk, "text", None)
-            if text:
-                yield {"type": "token", "content": text}
+        for stream_attempt in range(3):
+            try:
+                for chunk in self.client.models.generate_content_stream(
+                    model=self.model_id,
+                    contents=answer_prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=1024,
+                        temperature=0.2,
+                    ),
+                ):
+                    text = getattr(chunk, "text", None)
+                    if text:
+                        yield {"type": "token", "content": text}
+                break  # success
+            except Exception as exc:
+                err_str = str(exc)
+                is_transient = any(k in err_str for k in ("500", "INTERNAL", "503", "UNAVAILABLE", "overloaded"))
+                if stream_attempt < 2 and is_transient:
+                    print(f"[answer] stream error (attempt {stream_attempt+1}), retrying: {exc}")
+                    time.sleep(2 ** stream_attempt)
+                    continue
+                # Non-transient or exhausted retries — propagate friendly message
+                raise RuntimeError(f"API error — please try again. ({type(exc).__name__})") from exc
 
         if all_sources:
             yield {

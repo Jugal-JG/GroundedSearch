@@ -113,6 +113,84 @@
     .badge.model { color: #a78bfa; border-color: rgba(99,102,241,0.3); background: rgba(99,102,241,0.08); }
     .badge.wiki  { color: #60a5fa; border-color: rgba(96,165,250,0.3); background: rgba(96,165,250,0.08); }
 
+    /* ── Mode toggle ─────────────────────────────────────────── */
+    .mode-toggle {
+      display: flex;
+      align-items: center;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border-light);
+      border-radius: 99px;
+      padding: 3px;
+      gap: 2px;
+    }
+
+    .mode-btn {
+      padding: 5px 14px;
+      border-radius: 99px;
+      border: none;
+      font-size: 12.5px;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all 0.2s;
+      color: var(--muted2);
+      background: transparent;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+
+    .mode-btn.active {
+      background: linear-gradient(135deg, #6366f1, #7c3aed);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(99,102,241,0.35);
+    }
+
+    .mode-btn:not(.active):hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.06);
+    }
+
+    /* ── New Chat button ─────────────────────────────────────── */
+    .new-chat-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 13px;
+      border-radius: 8px;
+      border: 1px solid var(--border-light);
+      background: var(--surface);
+      color: var(--muted2);
+      font-size: 12.5px;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .new-chat-btn:hover {
+      border-color: rgba(99,102,241,0.4);
+      color: var(--accent2);
+      background: rgba(99,102,241,0.08);
+    }
+
+    /* ── Mode indicator pill in message ─────────────────────── */
+    .mode-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      margin-bottom: 6px;
+    }
+    .mode-pill.grounded { color: #a78bfa; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); }
+    .mode-pill.fast     { color: #fbbf24; background: rgba(251,191,36,0.1);  border: 1px solid rgba(251,191,36,0.2); }
+
     /* ── Chat area ───────────────────────────────────────────── */
     main {
       flex: 1;
@@ -512,9 +590,25 @@
       <div class="logo-icon">W</div>
       <span class="logo-text">Grounded<span>Search</span></span>
     </div>
+
+    <!-- Mode toggle (centre) -->
+    <div class="mode-toggle">
+      <button class="mode-btn active" id="btn-fast" onclick="setMode('fast')" title="One Wikipedia search, fast answer (~10-15s)">
+        ⚡ Fast
+      </button>
+      <button class="mode-btn" id="btn-grounded" onclick="setMode('grounded')" title="Iterative Wikipedia search, thorough answer (~25-45s)">
+        🔬 GroundedSearch
+      </button>
+    </div>
+
     <div class="header-right">
+      <button class="new-chat-btn" onclick="newChat()" title="Start a new conversation">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        New Chat
+      </button>
       <span class="badge model">Gemma 4 31B</span>
-      <span class="badge wiki">Wikipedia RAG</span>
     </div>
   </header>
 
@@ -526,7 +620,7 @@
       <div class="welcome" id="welcome">
         <div class="welcome-icon">W</div>
         <h1>Ask anything, grounded in Wikipedia</h1>
-        <p>I search Wikipedia iteratively to find factual context, then compose a precise answer — no hallucinations from thin air.</p>
+        <p id="welcome-desc">One Wikipedia search · Fast answer · Wikipedia sources included</p>
         <div class="examples">
           <div class="example-chip" onclick="useExample(this)">Who won the 2023 NBA championship?</div>
           <div class="example-chip" onclick="useExample(this)">What is quantum entanglement?</div>
@@ -555,32 +649,105 @@
         </svg>
       </button>
     </div>
-    <p class="footer-note">Answers grounded in Wikipedia · Powered by Gemma 4 31B via Google AI Studio</p>
+    <p class="footer-note" id="footer-note">⚡ Fast mode · 1 Wikipedia search · Powered by Gemma 4 31B</p>
   </footer>
 
 </div>
 
 <script>
-  // ── State ────────────────────────────────────────────────────
-  let isStreaming = false;
+  // ── State ─────────────────────────────────────────────────────
+  let isStreaming  = false;
   let currentMsgId = 0;
-  let answerBuffer = '';   // accumulates markdown tokens for final render
+  let answerBuffer = '';
+  let currentMode  = 'fast';   // 'fast' | 'grounded'
 
-  // ── Marked config ────────────────────────────────────────────
+  // Per-mode saved chat state — null means "show welcome screen"
+  const modeState = {
+    fast:     { html: null, msgId: 0 },
+    grounded: { html: null, msgId: 0 },
+  };
+
+  // ── Marked config ─────────────────────────────────────────────
   marked.setOptions({ breaks: true, gfm: true });
 
-  // ── Auto-resize textarea ─────────────────────────────────────
+  // ── Auto-resize textarea ──────────────────────────────────────
   const textarea = document.getElementById('query-input');
   textarea.addEventListener('input', () => {
     textarea.style.height = 'auto';
     textarea.style.height = Math.min(textarea.scrollHeight, 160) + 'px';
   });
   textarea.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
   });
+
+  // ── Mode toggle ───────────────────────────────────────────────
+  const MODES = {
+    fast:      { label: '⚡ Fast mode', footer: '⚡ Fast mode · 1 Wikipedia search · Powered by Gemma 4 31B', welcome: 'One Wikipedia search · Fast answer (~10-15s) · Sources included' },
+    grounded:  { label: '🔬 GroundedSearch', footer: '🔬 GroundedSearch · Iterative Wikipedia retrieval · Powered by Gemma 4 31B', welcome: 'Iterative Wikipedia searches · Deep grounded answer (~25-45s) · Sources included' },
+  };
+
+  function setMode(mode) {
+    if (mode === currentMode || isStreaming) return;
+
+    // ── Save current mode's chat state ──────────────────────────
+    modeState[currentMode].html  = document.getElementById('messages').innerHTML;
+    modeState[currentMode].msgId = currentMsgId;
+
+    // ── Switch ───────────────────────────────────────────────────
+    currentMode = mode;
+    answerBuffer = '';
+
+    // ── Update toggle buttons ────────────────────────────────────
+    document.getElementById('btn-fast').classList.toggle('active', mode === 'fast');
+    document.getElementById('btn-grounded').classList.toggle('active', mode === 'grounded');
+
+    // ── Update footer + placeholder ──────────────────────────────
+    const m = MODES[mode];
+    document.getElementById('footer-note').textContent = m.footer;
+    textarea.placeholder = mode === 'fast'
+      ? 'Ask anything — fast Wikipedia-grounded answer...'
+      : 'Ask anything — deep iterative Wikipedia search...';
+
+    // ── Restore this mode's chat (or welcome screen) ─────────────
+    if (modeState[mode].html !== null) {
+      document.getElementById('messages').innerHTML = modeState[mode].html;
+      currentMsgId = modeState[mode].msgId;
+    } else {
+      _showWelcome(mode);
+    }
+  }
+
+  // ── Render welcome screen for the given mode ──────────────────
+  function _showWelcome(mode) {
+    document.getElementById('messages').innerHTML = `
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">W</div>
+        <h1>Ask anything, grounded in Wikipedia</h1>
+        <p id="welcome-desc">${MODES[mode].welcome}</p>
+        <div class="examples">
+          <div class="example-chip" onclick="useExample(this)">Who won the 2023 NBA championship?</div>
+          <div class="example-chip" onclick="useExample(this)">What is quantum entanglement?</div>
+          <div class="example-chip" onclick="useExample(this)">When was the Eiffel Tower built?</div>
+          <div class="example-chip" onclick="useExample(this)">Who invented the internet?</div>
+          <div class="example-chip" onclick="useExample(this)">What caused the 2008 financial crisis?</div>
+          <div class="example-chip" onclick="useExample(this)">Compare GPT and BERT architectures</div>
+        </div>
+      </div>`;
+    currentMsgId = 0;
+    answerBuffer = '';
+  }
+
+  // ── New Chat — clears ONLY the active mode's history ─────────
+  function newChat() {
+    if (isStreaming) return;
+    // Reset saved state for current mode
+    modeState[currentMode].html  = null;
+    modeState[currentMode].msgId = 0;
+    _showWelcome(currentMode);
+    textarea.value = '';
+    textarea.style.height = 'auto';
+    textarea.focus();
+  }
 
   // ── Example chips ─────────────────────────────────────────────
   function useExample(el) {
@@ -589,7 +756,7 @@
     textarea.focus();
   }
 
-  // ── Main send handler ────────────────────────────────────────
+  // ── Main send handler ─────────────────────────────────────────
   async function handleSend() {
     const query = textarea.value.trim();
     if (!query || isStreaming) return;
@@ -599,19 +766,16 @@
     textarea.value = '';
     textarea.style.height = 'auto';
 
-    // Hide welcome, show chat
     const welcome = document.getElementById('welcome');
     if (welcome) welcome.remove();
 
-    // Add user message
     appendUserMsg(query);
 
-    // Add assistant placeholder
     const msgId = ++currentMsgId;
-    appendAssistantMsg(msgId);
+    appendAssistantMsg(msgId, currentMode);
 
     try {
-      await streamResponse(query, msgId);
+      await streamResponse(query, msgId, currentMode);
     } catch (err) {
       setError(msgId, err.message);
     }
@@ -621,7 +785,7 @@
     textarea.focus();
   }
 
-  // ── DOM helpers ──────────────────────────────────────────────
+  // ── DOM helpers ───────────────────────────────────────────────
   function appendUserMsg(text) {
     const div = document.createElement('div');
     div.className = 'msg user';
@@ -630,8 +794,11 @@
     scrollBottom();
   }
 
-  function appendAssistantMsg(id) {
+  function appendAssistantMsg(id, mode) {
     answerBuffer = '';
+    const pill = mode === 'fast'
+      ? `<div class="mode-pill fast">⚡ Fast</div>`
+      : `<div class="mode-pill grounded">🔬 GroundedSearch</div>`;
     const div = document.createElement('div');
     div.className = 'msg assistant';
     div.id = `msg-${id}`;
@@ -645,6 +812,7 @@
           <div class="search-items" id="si-${id}"></div>
         </div>
         <div class="answer-area" id="aa-${id}" style="display:none">
+          ${pill}
           <div class="answer-text cursor" id="at-${id}"></div>
         </div>
         <div class="sources-area" id="src-${id}" style="display:none"></div>
@@ -653,12 +821,12 @@
     scrollBottom();
   }
 
-  // ── SSE stream ───────────────────────────────────────────────
-  async function streamResponse(query, msgId) {
+  // ── SSE stream ────────────────────────────────────────────────
+  async function streamResponse(query, msgId, mode) {
     const resp = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query, mode }),
     });
 
     if (!resp.ok) throw new Error(`Server error: ${resp.status}`);
@@ -670,57 +838,52 @@
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
       buf = lines.pop();
-
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
-        try {
-          const event = JSON.parse(line.slice(6));
-          handleEvent(event, msgId);
-        } catch (_) {}
+        try { handleEvent(JSON.parse(line.slice(6)), msgId); } catch (_) {}
       }
     }
   }
 
-  // ── Event handlers ───────────────────────────────────────────
+  // ── Event handlers ────────────────────────────────────────────
   function handleEvent(ev, msgId) {
     switch (ev.type) {
 
       case 'search_start':
-        addSearchItem(msgId, ev.query, false);
+        addSearchItem(msgId, ev.query);
         break;
 
       case 'search_done':
-        resolveSearchItem(msgId, ev.query, ev.title, ev.url);
+        // ev.query is the exact term that was searched — use it directly for ID lookup
+        resolveSearchItem(msgId, ev.query || activeSearchQueries[msgId], ev.title, ev.url);
         break;
 
       case 'search_empty': {
-        // Wikipedia returned nothing — mark item as grey so spinner never hangs
-        const id = `sitem-${msgId}-${slugify(activeSearchQueries[msgId] || ev.query)}`;
+        const q = ev.query || activeSearchQueries[msgId];
+        const id = `sitem-${msgId}-${slugify(q)}`;
         const div = document.getElementById(id);
         if (div) {
           div.className = 'search-item empty';
           div.innerHTML = `
             <div class="s-dot"></div>
-            <span class="s-query">"${escapeHtml(activeSearchQueries[msgId] || ev.query)}"</span>
-            <span class="s-arrow">→</span>
-            <span style="color:var(--muted);font-size:12px">no results, retrying…</span>`;
+            <span class="s-query">"${escapeHtml(q)}"</span>
+            <span class="s-arrow">&#8594;</span>
+            <span style="color:var(--muted);font-size:12px">no results, retrying...</span>`;
         }
         break;
       }
 
       case 'answer_start': {
-        // Transition: mark search section done, reveal answer
-        const sh = document.getElementById(`sh-${msgId}`);
+        const sh   = document.getElementById(`sh-${msgId}`);
         const spin = document.getElementById(`spin-${msgId}`);
         if (sh) {
-          spin.className = 'spinner done';
-          spin.textContent = '✓';
-          sh.className = 'search-header done';
-          sh.innerHTML = `<span style="color:var(--green);font-size:14px">✓</span> Sources retrieved`;
+          spin.className   = 'spinner done';
+          spin.textContent = '';
+          sh.className     = 'search-header done';
+          sh.innerHTML     = `<span style="color:var(--green);font-size:14px">&#10003;</span> Sources retrieved`;
         }
         const aa = document.getElementById(`aa-${msgId}`);
         if (aa) aa.style.display = '';
@@ -730,23 +893,17 @@
       case 'token': {
         answerBuffer += ev.content;
         const at = document.getElementById(`at-${msgId}`);
-        if (at) {
-          at.innerHTML = marked.parse(answerBuffer);
-          at.classList.add('cursor');
-        }
+        if (at) { at.innerHTML = marked.parse(answerBuffer); at.classList.add('cursor'); }
         scrollBottom();
         break;
       }
 
       case 'sources': {
-        const at = document.getElementById(`at-${msgId}`);
-        if (at) at.classList.remove('cursor');
-
+        document.getElementById(`at-${msgId}`)?.classList.remove('cursor');
         const srcDiv = document.getElementById(`src-${msgId}`);
         if (!srcDiv || !ev.sources?.length) break;
         srcDiv.style.display = '';
-
-        let html = '<div class="source-label">Sources</div>';
+        let html = '<div class="source-label">Wikipedia Sources</div>';
         for (const s of ev.sources) {
           html += `
             <a class="source-card" href="${escapeHtml(s.url)}" target="_blank" rel="noopener">
@@ -766,7 +923,6 @@
       }
 
       case 'done':
-        // Remove streaming cursor if still present
         document.getElementById(`at-${msgId}`)?.classList.remove('cursor');
         break;
 
@@ -777,60 +933,57 @@
   }
 
   // ── Search item helpers ───────────────────────────────────────
-  const activeSearchQueries = {};   // msgId → last query string
+  const activeSearchQueries = {};
 
   function addSearchItem(msgId, query) {
     activeSearchQueries[msgId] = query;
     const si = document.getElementById(`si-${msgId}`);
     if (!si) return;
-
     const div = document.createElement('div');
     div.className = 'search-item active';
     div.id = `sitem-${msgId}-${slugify(query)}`;
-    div.innerHTML = `
-      <div class="s-dot"></div>
-      <span class="s-query">"${escapeHtml(query)}"</span>`;
+    div.innerHTML = `<div class="s-dot"></div><span class="s-query">"${escapeHtml(query)}"</span>`;
     si.appendChild(div);
     scrollBottom();
   }
 
   function resolveSearchItem(msgId, query, title, url) {
-    const id = `sitem-${msgId}-${slugify(activeSearchQueries[msgId] || query)}`;
+    // Always use the specific query from the event for ID lookup.
+    // Using activeSearchQueries[msgId] was wrong for parallel searches because
+    // it only stores the last search_start term, so all resolves hit the same element.
+    const id  = `sitem-${msgId}-${slugify(query)}`;
     const div = document.getElementById(id);
     if (!div) return;
-
     div.className = 'search-item done';
     div.innerHTML = `
       <div class="s-dot"></div>
-      <span class="s-query">"${escapeHtml(activeSearchQueries[msgId] || query)}"</span>
-      <span class="s-arrow">→</span>
+      <span class="s-query">"${escapeHtml(query)}"</span>
+      <span class="s-arrow">&#8594;</span>
       <a class="s-result" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`;
   }
 
   // ── Error state ───────────────────────────────────────────────
   function setError(msgId, msg) {
+    // Stop the spinner — without this it spins forever on error
+    const spin = document.getElementById(`spin-${msgId}`);
+    const sh   = document.getElementById(`sh-${msgId}`);
+    if (spin) { spin.className = 'spinner done'; spin.textContent = ''; }
+    if (sh)   { sh.className = 'search-header'; sh.innerHTML = `<span style="color:var(--red);font-size:14px">&#9888;</span> Search failed`; }
+
     const aa = document.getElementById(`aa-${msgId}`);
-    if (aa) {
-      aa.style.display = '';
-      aa.innerHTML = `<div style="color:var(--red);font-size:13.5px">⚠ ${escapeHtml(msg)}</div>`;
-    }
+    if (aa) { aa.style.display = ''; aa.innerHTML = `<div style="color:var(--red);font-size:13.5px">&#9888; ${escapeHtml(msg)}</div>`; }
     document.getElementById(`at-${msgId}`)?.classList.remove('cursor');
   }
 
   // ── Utils ─────────────────────────────────────────────────────
-  function scrollBottom() {
-    const el = document.getElementById('main-scroll');
-    el.scrollTop = el.scrollHeight;
-  }
+  function scrollBottom() { const el = document.getElementById('main-scroll'); el.scrollTop = el.scrollHeight; }
 
   function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   function slugify(s) {
-    return String(s).toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').slice(0, 40);
+    return String(s).toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'').slice(0,40);
   }
 </script>
 </body>
